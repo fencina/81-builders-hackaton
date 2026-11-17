@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createClient } from '@libsql/client';
+import { requestTables } from './shift-requests';
 
 mkdirSync(resolve('.data'), { recursive: true });
 export const db = createClient({
@@ -10,6 +11,8 @@ export const db = createClient({
 let initialization: Promise<unknown> | undefined;
 export function initializeDatabase() {
   return initialization ??= db.executeMultiple(`
+    ${requestTables}
+    CREATE TABLE IF NOT EXISTS whatsapp_messages (id TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS employees (id TEXT PRIMARY KEY, phone_number TEXT NOT NULL, name TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS shifts (
       id TEXT PRIMARY KEY, start_at TEXT NOT NULL, end_at TEXT NOT NULL,
@@ -65,8 +68,14 @@ export async function assignShift(shiftId: string, employeeId: string) {
   const result = await db.execute({
     sql: `UPDATE shifts SET employee_id = ?, status = 'not available'
       WHERE id = ? AND status = 'available' AND employee_id IS NULL
-      AND EXISTS (SELECT 1 FROM employees WHERE id = ?)`,
-    args: [employeeId, shiftId, employeeId],
+      AND EXISTS (SELECT 1 FROM employees WHERE id = ?)
+      AND julianday(start_at) > julianday('now')
+      AND NOT EXISTS (
+        SELECT 1 FROM shifts assigned WHERE assigned.employee_id = ?
+        AND julianday(assigned.start_at) < julianday(shifts.end_at)
+        AND julianday(shifts.start_at) < julianday(assigned.end_at)
+      )`,
+    args: [employeeId, shiftId, employeeId, employeeId],
   });
   return { assigned: result.rowsAffected === 1, shift_id: shiftId, employee_id: employeeId };
 }

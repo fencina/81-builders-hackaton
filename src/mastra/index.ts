@@ -12,7 +12,7 @@ import {
 import { agent } from './agents/agent';
 import { findUrgentShiftsTool, sendWhatsAppMessageTool, assignShiftTool } from './tools/shift-tools';
 import { urgentShiftsWorkflow } from './workflows/urgent-shifts';
-import { incomingMessage, handleIncomingMessage } from './lib/conversations';
+import { incomingMessage, handleIncomingMessage, flushShiftNotifications } from './lib/conversations';
 
 export const mastra = new Mastra({
   bundler: {
@@ -63,6 +63,7 @@ async function pollUrgentShifts() {
   if (polling) return;
   polling = true;
   try {
+    await flushShiftNotifications();
     const run = await mastra.getWorkflow('urgentShiftsWorkflow').createRun();
     const result = await run.start({ inputData: {} });
     console.log('[urgent-shifts]', result.status === 'success' ? result.result : result);

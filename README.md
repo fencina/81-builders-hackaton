@@ -29,6 +29,80 @@ The loop in `src/mastra/index.ts` runs once shortly after startup and every five
 5. The agent continues the conversation using one memory thread per employee. Questions and ambiguous acceptance keep the conversation active. Explicit acceptance of a specific shift updates `employee_id` and status to `not available`, then sends confirmation and closes the conversation. An explicit refusal sends a brief thank-you and closes it without assigning a shift. Later messages for a closed conversation are ignored; a new day’s outreach can start a new conversation. If someone else fills the selected shift first, the employee is asked about another shift.
 6. The reply endpoint sends the agent's final response back through OpenWA.
 
+## Reset a demo
+
+Stop the coordinator (`npm run dev` or the production server) first, then run:
+
+```shell
+npm run db:reset
+```
+
+This loads `.env` and clears all employees, shifts, outreach, conversation statuses,
+shift change requests, queued notifications, and processed WhatsApp message IDs
+from `SHIFTS_DATABASE_URL` (default: `.data/shifts.db`). The reset is permanent.
+It preserves the schema, Mastra chat history, and the separate Turno web admin data.
+To populate an example, configure `DEMO_EMPLOYEE_PHONE` in `.env` with your test
+WhatsApp number including country code, then run:
+
+```shell
+npm run db:seed
+npm run dev
+```
+
+The seed creates tomorrow's urgent shift (09:00–13:00) and an overlapping assigned
+shift (11:00–15:00), in `BUSINESS_TIMEZONE`. It reuses a matching employee, or creates
+one with a fresh ID after a reset. Without a demo phone, it uses the first existing
+employee; `DEMO_EMPLOYEE_ID` selects a specific employee. Existing shift rows are
+preserved on repeat runs. Configure `SHIFT_MANAGER_PHONE` for the approval flow.
+Accept the offered `demo-<date>-urgent` shift to exercise manager approval.
+
+Use the **same absolute `SHIFTS_DATABASE_URL`** for scripts and Mastra Studio.
+`mastra dev` changes its working directory, so a relative/default database path can
+otherwise open a different file. Restart Mastra after updating `.env`.
+
+For completely fresh conversations, use new demo employee IDs so the agent starts
+new memory threads. Restarting also clears in-memory message queues.
+
+## Shift change approval
+
+Set `SHIFT_MANAGER_PHONE` to the manager's WhatsApp number, including country code.
+The manager uses the same OpenWA session and incoming webhook as employees; they do
+not need an employee record. Restart the agent after changing configuration.
+
+Before assigning an accepted urgent shift, the coordinator checks the employee's
+assignments for time overlaps. It also understands requests to leave a specific
+future assigned shift in exchange for taking an urgent shift. Ambiguous requests
+are clarified before proceeding.
+
+The manager receives a request ID, employee name and ID, the urgent shift's date
+and times, and the date and times of every shift requested for release, all in
+`BUSINESS_TIMEZONE`. They reply `APPROVE <request ID>` or `DENY <request ID>`.
+Only the phone number that received the request can decide it.
+
+Approval removes the original assignments and fills the urgent shift in one
+transaction, then notifies the employee and manager. Denial changes no assignments
+and asks the employee to reply `yes` or `no`. An explicit yes assigns the urgent
+shift **while keeping the original assignments, including disclosed overlaps**,
+as requested by this policy; both parties are notified. No thanks the employee
+and informs the manager, with no assignment changes.
+
+Requests survive restarts and are handled even when the original offer date has
+passed. Completion rechecks that the shifts have not changed and the urgent shift
+is still available and in the future. If validation fails, original assignments
+are preserved and both parties are notified. Further outreach pauses while a
+change request is pending. Without manager configuration, the employee is told
+to contact their manager and the schedule stays unchanged.
+
+Notifications are saved with the decision and retried on incoming messages and
+polling ticks. With polling disabled, retries wait for another incoming message.
+A crash after WhatsApp accepts a send but before its delivery is recorded can
+produce a duplicate notification; assignment changes remain idempotent.
+This flow belongs to the WhatsApp coordinator's `shifts` database; the separate
+Turno web admin uses its existing `shifts_turns`/applications flow.
+
+Run `npm run test:shifts` for the approval, denial, overlap, authorization,
+schedule-change, replay, and notification retry regression tests.
+
 ## Database
 
 The application creates `.data/shifts.db` automatically. This is separate from Mastra's memory database. Set `SHIFTS_DATABASE_URL` (and optionally `SHIFTS_DATABASE_AUTH_TOKEN`) to use a shared libSQL database instead. Use an absolute file URL when sharing a local file with another application.
@@ -40,6 +114,8 @@ Tables:
 - `outreach`: `shift_id`, `employee_id`, `sent_at`
 - `shift_conversations`: `employee_id`, `offer_date`, `status` (`active`, `assigned`, `declined`)
 - `whatsapp_messages`: processed inbound message IDs to suppress duplicate replies
+- `shift_change_requests`: persisted manager/employee decisions and original shift snapshots
+- `shift_notifications`: pending and delivered approval-flow WhatsApp notifications
 
 IDs are strings. Store timestamps as ISO 8601 with a timezone, e.g. `2026-11-16T09:00:00+09:00`. Store employee phone numbers with country codes. No employees or shifts are seeded automatically, so startup does not contact anyone until you add records.
 

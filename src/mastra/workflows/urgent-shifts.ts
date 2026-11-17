@@ -19,6 +19,11 @@ const contact = createStep({
     const errors: string[] = [];
     if (!inputData.shifts.length) return { urgentShifts: 0, employeesContacted, errors };
     for (const employee of await getEmployees()) {
+      const pendingChange = await db.execute({
+        sql: "SELECT id FROM shift_change_requests WHERE employee_id=? AND status IN ('manager_pending','employee_pending')",
+        args: [employee.id],
+      });
+      if (pendingChange.rows.length) continue;
       const conversation = await getConversation(employee.id);
       if (conversation?.offer_date === inputData.date && conversation.status !== 'active') continue;
       const sent = await db.execute({ sql: 'SELECT shift_id FROM outreach WHERE employee_id = ?', args: [employee.id] });
