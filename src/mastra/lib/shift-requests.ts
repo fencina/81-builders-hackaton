@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
 import type { Client, Transaction } from '@libsql/client';
 import type { Shift } from './database';
 
@@ -17,12 +17,33 @@ export const requestTables = `
     id TEXT PRIMARY KEY, employee_id TEXT NOT NULL, urgent_id TEXT NOT NULL, urgent_shift TEXT NOT NULL,
     release_shifts TEXT NOT NULL, manager_phone TEXT NOT NULL, status TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS shift_request_codes (
+    code TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE
+  );
   CREATE UNIQUE INDEX IF NOT EXISTS one_pending_change ON shift_change_requests(employee_id)
     WHERE status IN ('manager_pending', 'employee_pending');
   CREATE TABLE IF NOT EXISTS shift_notifications (
     id TEXT PRIMARY KEY, phone TEXT NOT NULL, message TEXT NOT NULL, sent_at TEXT
   );
 `;
+
+// Full IDs remain accepted for manager messages sent before short codes existed.
+export function parseManagerCommand(message: string) {
+  const match = message
+    .trim()
+    .match(
+      /^(APPROVE|DENY)\s+([a-z0-9]{4}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/i,
+    );
+  return match
+    ? {
+        id:
+          match[2].length === 4
+            ? match[2].toUpperCase()
+            : match[2].toLowerCase(),
+        approved: match[1].toUpperCase() === 'APPROVE',
+      }
+    : null;
+}
 
 // Approval state and schedule updates belong to one business transaction. WhatsApp
 // delivery is retried separately; a delivery failure must never roll back a decision.
@@ -69,6 +90,22 @@ export class ShiftRequests {
       sql: 'INSERT INTO shift_notifications(id,phone,message) VALUES(?,?,?)',
       args: [randomUUID(), phone, message],
     });
+  }
+  private async createCode(sql: SQL, requestId: string) {
+    for (let attempt = 0; attempt < 32; attempt++) {
+      const code = randomInt(36 ** 4)
+        .toString(36)
+        .padStart(4, '0')
+        .toUpperCase();
+      const result = await sql.execute({
+        sql: 'INSERT OR IGNORE INTO shift_request_codes(code,request_id) VALUES(?,?)',
+        args: [code, requestId],
+      });
+      if (result.rowsAffected === 1) return code;
+    }
+    throw new Error(
+      'Could not allocate a unique four-character approval code. Please try again.',
+    );
   }
   private async shift(sql: SQL, id: string) {
     return (
@@ -129,6 +166,7 @@ export class ShiftRequests {
         throw new Error('Select future shifts assigned to this employee');
       const id = randomUUID();
       const employee = await this.employee(tx, employeeId);
+      const code = await this.createCode(tx, id);
       await tx.execute({
         sql: 'INSERT INTO shift_change_requests VALUES(?,?,?,?,?,?,?)',
         args: [
@@ -144,7 +182,7 @@ export class ShiftRequests {
       await this.queue(
         tx,
         managerPhone,
-        `Shift change request ${id}\nUrgent shift: ${this.label(urgent)}\nEmployee: ${employee.name} (${employeeId})\nRequests removal from:\n${release.map((s) => this.label(s)).join('\n')}\nApprove or deny this request. Reply APPROVE ${id} or DENY ${id}.`,
+        `Shift change request ${code}\nUrgent shift: ${this.label(urgent)}\nEmployee: ${employee.name} (${employeeId})\nRequests removal from:\n${release.map((s) => this.label(s)).join('\n')}\nApprove or deny this request. Reply APPROVE ${code} or DENY ${code}.`,
       );
       await this.queue(
         tx,
@@ -180,6 +218,19 @@ export class ShiftRequests {
         await tx.rollback();
         return false;
       }
+      if (/^[a-z0-9]{4}$/i.test(id)) {
+        const mapping = (
+          await tx.execute({
+            sql: 'SELECT request_id FROM shift_request_codes WHERE code=?',
+            args: [id.toUpperCase()],
+          })
+        ).rows[0];
+        if (!mapping) {
+          await tx.rollback();
+          return false;
+        }
+        id = String(mapping.request_id);
+      }
       const request = (
         await tx.execute({
           sql: 'SELECT * FROM shift_change_requests WHERE id=?',
@@ -190,6 +241,13 @@ export class ShiftRequests {
         await tx.rollback();
         return false;
       }
+      const codeRow = (
+        await tx.execute({
+          sql: 'SELECT code FROM shift_request_codes WHERE request_id=?',
+          args: [id],
+        })
+      ).rows[0];
+      const displayId = codeRow ? String(codeRow.code) : id;
       const employee = await this.employee(tx, request.employee_id);
       const normalize = (s: string) => {
         const d = s.replace(/\D/g, '');
@@ -220,7 +278,7 @@ export class ShiftRequests {
         await this.queue(
           tx,
           request.manager_phone,
-          `Request ${id} denied. No assignments changed; asking ${employee.name} whether they still want the urgent shift.`,
+          `Request ${displayId} denied. No assignments changed; asking ${employee.name} whether they still want the urgent shift.`,
         );
       } else if (!yes) {
         status = 'declined';
@@ -232,7 +290,7 @@ export class ShiftRequests {
         await this.queue(
           tx,
           request.manager_phone,
-          `${employee.name} declined the urgent shift after denial of request ${id}. No assignments changed.`,
+          `${employee.name} declined the urgent shift after denial of request ${displayId}. No assignments changed.`,
         );
       } else {
         // Revalidate the exact schedule seen by the manager. Never release shifts
@@ -272,7 +330,7 @@ export class ShiftRequests {
           await this.queue(
             tx,
             request.manager_phone,
-            `Request ${id} could not be completed because the schedule changed. No assignments were changed.`,
+            `Request ${displayId} could not be completed because the schedule changed. No assignments were changed.`,
           );
         } else {
           await tx.execute({
@@ -301,7 +359,7 @@ export class ShiftRequests {
           await this.queue(
             tx,
             request.manager_phone,
-            `${employee.name}: request ${id} ${status}. Assigned to ${this.label(urgent)}. ${actor === 'manager' ? 'Requested original shifts released.' : 'Employee explicitly accepted after denial; original assignments retained, including the disclosed overlaps.'}`,
+            `${employee.name}: request ${displayId} ${status}. Assigned to ${this.label(urgent)}. ${actor === 'manager' ? 'Requested original shifts released.' : 'Employee explicitly accepted after denial; original assignments retained, including the disclosed overlaps.'}`,
           );
         }
       }

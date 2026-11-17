@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { agent } from '../agents/agent';
 import { assignShift, db, findUrgentShifts, getConversation, getEmployees, initializeDatabase, setConversation } from './database';
-import { ShiftRequests } from './shift-requests';
+import { ShiftRequests, parseManagerCommand } from './shift-requests';
 import { businessTimezone } from './database';
 import { normalizePhone, resolveSenderPhone, sendWhatsAppMessage, sendWhatsAppToPhone } from './whatsapp';
 export const shiftRequests = new ShiftRequests(db, businessTimezone);
@@ -57,14 +57,14 @@ async function respond(payload: z.infer<typeof incomingMessage>, messageId: stri
   if (!phone) return { ignored: true, reason: 'Could not resolve sender phone' };
   await initializeDatabase();
   await flushShiftNotifications();
-  const managerCommand = message.body.trim().match(/^(APPROVE|DENY)\s+([a-f0-9-]{36})$/i);
+  const managerCommand = parseManagerCommand(message.body);
   if (managerCommand) {
-    const changed = await shiftRequests.decide(managerCommand[2], 'manager', phone, managerCommand[1].toUpperCase() === 'APPROVE', messageId);
+    const changed = await shiftRequests.decide(managerCommand.id, 'manager', phone, managerCommand.approved, messageId);
     await flushShiftNotifications();
     return { received: true, changed };
   }
   if (process.env.SHIFT_MANAGER_PHONE && normalizePhone(process.env.SHIFT_MANAGER_PHONE) === phone) {
-    await sendWhatsAppToPhone(phone, 'To decide a shift change request, reply APPROVE <request ID> or DENY <request ID> using the ID in the request.');
+    await sendWhatsAppToPhone(phone, 'To decide a shift change request, reply APPROVE <4-character code> or DENY <4-character code> using the code in the request.');
     return { received: true };
   }
   const employee = (await getEmployees()).find(e => normalizePhone(e.phone_number) === phone);

@@ -9,6 +9,7 @@ if (!process.env.SHIFTS_DATABASE_URL) mkdirSync(resolve('.data'), { recursive: t
 const db = createClient({ url, authToken: process.env.SHIFTS_DATABASE_AUTH_TOKEN });
 const tables = [
   'shift_notifications',
+  'shift_request_codes',
   'shift_change_requests',
   'whatsapp_messages',
   'shift_conversations',

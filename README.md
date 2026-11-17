@@ -74,9 +74,11 @@ assignments for time overlaps. It also understands requests to leave a specific
 future assigned shift in exchange for taking an urgent shift. Ambiguous requests
 are clarified before proceeding.
 
-The manager receives a request ID, employee name and ID, the urgent shift's date
+The manager receives a unique four-character approval code, employee name and ID, the urgent shift's date
 and times, and the date and times of every shift requested for release, all in
-`BUSINESS_TIMEZONE`. They reply `APPROVE <request ID>` or `DENY <request ID>`.
+`BUSINESS_TIMEZONE`. They reply `APPROVE A7B2` or `DENY A7B2`, using the code in the message.
+Codes are case-insensitive and are not reused until the database is reset.
+Replies using full IDs from older messages still work.
 Only the phone number that received the request can decide it.
 
 Approval removes the original assignments and fills the urgent shift in one

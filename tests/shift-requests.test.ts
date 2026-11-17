@@ -4,6 +4,7 @@ import { createClient } from '@libsql/client';
 import {
   ShiftRequests,
   requestTables,
+  parseManagerCommand,
 } from '../src/mastra/lib/shift-requests.ts';
 
 async function fixture(t: { after: (fn: () => void) => void }) {
@@ -42,13 +43,23 @@ test('overlap requests include employee, both shifts, timezone and decision comm
   assert.equal(await f.owner('urgent'), null);
   assert.equal(await f.owner('original'), 'employee');
   const text = (await f.messages())[0];
+  const code = String(
+    (
+      await f.db.execute({
+        sql: 'SELECT code FROM shift_request_codes WHERE request_id=?',
+        args: [id],
+      })
+    ).rows[0].code,
+  );
+  assert.match(code, /^[A-Z0-9]{4}$/);
+  assert.ok(!text.includes(id));
   for (const value of [
     'Alex',
     'urgent',
     'original',
     'Asia/Tokyo',
-    'APPROVE ' + id,
-    'DENY ' + id,
+    'APPROVE ' + code,
+    'DENY ' + code,
   ])
     assert.ok(text.includes(value), value);
   assert.equal(await f.create(), id);
@@ -210,4 +221,131 @@ test('failed delivery retries after restart without replaying the schedule chang
   await f.service.flush(async () => {
     assert.fail('already delivered');
   });
+});
+
+test('manager commands accept four-character codes case-insensitively and legacy UUIDs', () => {
+  assert.deepEqual(parseManagerCommand(' approve a7b2 '), {
+    id: 'A7B2',
+    approved: true,
+  });
+  assert.deepEqual(parseManagerCommand('DENY 0Z9X'), {
+    id: '0Z9X',
+    approved: false,
+  });
+  const id = '12345678-abcd-4321-abcd-123456789abc';
+  assert.deepEqual(parseManagerCommand(`APPROVE ${id}`), {
+    id,
+    approved: true,
+  });
+  for (const text of [
+    'APPROVE ABC',
+    'DENY ABCDE',
+    'APPROVE A!B2',
+    'please approve A7B2',
+    'APPROVE A7B2 extra',
+  ])
+    assert.equal(parseManagerCommand(text), null);
+});
+
+test('short code approval survives a restart and retains manager authorization and replay protection', async (t) => {
+  const f = await fixture(t);
+  const id = await f.create();
+  const code = String(
+    (
+      await f.db.execute({
+        sql: 'SELECT code FROM shift_request_codes WHERE request_id=?',
+        args: [id],
+      })
+    ).rows[0].code,
+  );
+  const restarted = new ShiftRequests(f.db, 'Asia/Tokyo');
+  assert.equal(
+    await restarted.decide(code, 'manager', '1234', true, 'unauthorized'),
+    false,
+  );
+  assert.equal(
+    await restarted.decide('!!!!', 'manager', '819099999999', true, 'unknown'),
+    false,
+  );
+  assert.equal(
+    await restarted.decide(
+      code.toLowerCase(),
+      'manager',
+      '819099999999',
+      true,
+      'approve',
+    ),
+    true,
+  );
+  assert.equal(await f.owner('urgent'), 'employee');
+  assert.equal(await f.owner('original'), null);
+  assert.equal(
+    await restarted.decide(code, 'manager', '819099999999', true, 'repeat'),
+    false,
+  );
+  const notifications = await f.messages();
+  assert.ok(notifications.some((s) => s.includes(`request ${code} approved`)));
+  assert.ok(notifications.every((s) => !s.includes(id)));
+});
+
+test('short code denial keeps employee replies using the internal request ID', async (t) => {
+  const f = await fixture(t);
+  const id = await f.create();
+  const code = String(
+    (
+      await f.db.execute({
+        sql: 'SELECT code FROM shift_request_codes WHERE request_id=?',
+        args: [id],
+      })
+    ).rows[0].code,
+  );
+  assert.equal(
+    await f.service.decide(code, 'manager', '819099999999', false, 'deny'),
+    true,
+  );
+  assert.equal((await f.service.pending('employee'))?.id, id);
+  assert.equal(
+    await f.service.decide(id, 'employee', '819012345678', false, 'no'),
+    true,
+  );
+  assert.equal(await f.owner('urgent'), null);
+  assert.ok(
+    (await f.messages()).some((s) => s.includes(`Request ${code} denied`)),
+  );
+});
+
+test('codes remain unique across completed requests', async (t) => {
+  const f = await fixture(t);
+  const codes = new Set();
+  for (let i = 0; i < 20; i++) {
+    const id = await f.create();
+    const code = String(
+      (
+        await f.db.execute({
+          sql: 'SELECT code FROM shift_request_codes WHERE request_id=?',
+          args: [id],
+        })
+      ).rows[0].code,
+    );
+    assert.match(code, /^[A-Z0-9]{4}$/);
+    assert.ok(!codes.has(code));
+    codes.add(code);
+    await f.service.decide(code, 'manager', '819099999999', false, `deny-${i}`);
+    await f.service.decide(id, 'employee', '819012345678', false, `no-${i}`);
+  }
+  assert.equal(codes.size, 20);
+});
+
+test('legacy requests without a code can still be decided with their UUID', async (t) => {
+  const f = await fixture(t);
+  const id = await f.create();
+  await f.db.execute({
+    sql: 'DELETE FROM shift_request_codes WHERE request_id=?',
+    args: [id],
+  });
+  assert.equal(
+    await f.service.decide(id, 'manager', '819099999999', true, 'legacy'),
+    true,
+  );
+  assert.equal(await f.owner('urgent'), 'employee');
 });
